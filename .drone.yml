@@ -1,0 +1,18 @@
+workspace:
+  base: /workspace
+  path: src/github.com/weiwei04/ns-initializer
+
+clone:
+  compass.git:
+    image: index.qiniu.com/spock/git-plugin:cs-proxy
+    depth: 1
+
+pipeline:
+    build:
+      image: alexwei/golang-glide:1.8.3-cs-proxy
+      commands:
+      - export GOPATH=$GOPATH:/workspace
+      - make bootstrap
+      - make build
+      - make test
+      - make clean
