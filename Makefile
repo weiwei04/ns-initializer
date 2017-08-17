@@ -1,6 +1,5 @@
 bootstrap:
-	glide install
-	glide update --strip-vendor
+	glide install --strip-vendor
 
 build:
 	cd cmd/ns-initializer && go build
