@@ -6,8 +6,6 @@ import (
 
 	"io/ioutil"
 
-	//yaml "gopkg.in/yaml.v2"
-
 	"github.com/golang/glog"
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/yaml"
@@ -30,64 +28,51 @@ func New(config Config) *Controller {
 	return &Controller{config: config}
 }
 
-func loadResourceQuota(fileName string) (*v1.ResourceQuota, error) {
+func loadFromSpec(fileName string, obj interface{}) (interface{}, error) {
 	data, err := ioutil.ReadFile(fileName)
 	if err != nil {
 		return nil, err
 	}
-	quota := &v1.ResourceQuota{}
-	r := bytes.NewBuffer(data)
-	return quota, yaml.NewYAMLToJSONDecoder(r).Decode(quota)
-}
-
-func loadLimitRange(fileName string) (*v1.LimitRange, error) {
-	data, err := ioutil.ReadFile(fileName)
-	if err != nil {
-		return nil, err
-	}
-	limit := &v1.LimitRange{}
-	r := bytes.NewBuffer(data)
-	return limit, yaml.NewYAMLToJSONDecoder(r).Decode(limit)
+	return obj, yaml.NewYAMLToJSONDecoder(bytes.NewBuffer(data)).Decode(obj)
 }
 
 func (c *Controller) Run(stopCh <-chan struct{}) error {
-	quota, err := loadResourceQuota(c.config.ResourceQuota)
+	quota := &v1.ResourceQuota{}
+	_, err := loadFromSpec(c.config.ResourceQuota, quota)
 	if err != nil {
-		glog.Errorf("loadResourceQuota from %s failed, err:%s",
+		glog.Errorf("Load resourcequota from file:%s failed err:%v",
 			c.config.ResourceQuota, err)
 		return err
 	}
-	glog.Infof("loaded resouce quota file:")
-	glog.Infof("%#v", quota)
-	limit, err := loadLimitRange(c.config.LimitRange)
+	glog.V(1).Info("ke-quota:")
+	glog.V(1).Infof("%v", quota)
+	limit := &v1.LimitRange{}
+	_, err = loadFromSpec(c.config.LimitRange, limit)
 	if err != nil {
-		glog.Errorf("loadLimitRange from %s failed, err:%s",
+		glog.Errorf("Load limitrange from file:%s failed err:%v",
 			c.config.LimitRange, err)
 		return err
 	}
-	glog.Infof("loaded limitrange file:")
-	glog.Infof("%#v", limit)
+	glog.V(1).Info("ke-limit:")
+	glog.V(1).Infof("%v", limit)
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		glog.Errorf("client-go get InClusterConfig failed, err:%s", err)
+		glog.Errorf("Get InClusterConfig failed err:%s", err)
 		return err
 	}
-	glog.Infof("get in cluster config")
 	// creates the clientset
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		glog.Errorf("new clientset failed, err:%s", err)
+		glog.Errorf("New clientset failed err:%s", err)
 		return err
 	}
-	glog.Infof("create clientset from in cluster config")
 	informerFactory := informers.NewSharedInformerFactory(clientset, time.Second*10)
 	c.initializer = NewNSInitializer(
 		quota,
 		limit,
 		clientset,
 		informerFactory.Core().V1().Namespaces(),
-		time.Second*10)
-	glog.Infof("NewNSInitializer, try to run initializer")
+		time.Minute*5)
 	informerFactory.Start(stopCh)
 	c.initializer.Run(1, stopCh)
 	return nil
