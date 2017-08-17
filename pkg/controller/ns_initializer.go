@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"k8s.io/api/core/v1"
@@ -27,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -39,13 +41,13 @@ import (
 )
 
 const (
-	// namespaceDeletionGracePeriod is the time period to wait before processing a received namespace event.
-	// This allows time for the following to occur:
-	// * lifecycle admission plugins on HA apiservers to also observe a namespace
-	//   deletion and prevent new objects from being created in the terminating namespace
-	// * non-leader etcd servers to observe last-minute object creations in a namespace
-	//   so this controller's cleanup can actually clean up all objects
-	namespaceDeletionGracePeriod = 5 * time.Second
+	quotaName string = "ke-quota"
+	limitName string = "ke-limit"
+)
+
+const (
+	vipAnnotation   = "vip"
+	readyAnnotation = "ready"
 )
 
 // NamespaceController is responsible for performing actions dependent upon a namespace phase
@@ -109,22 +111,22 @@ func NewNSInitializer(
 func (nm *NSInitializer) enqueueNamespace(ns *v1.Namespace) {
 	// don't queue if we aren going to delete
 	if ns.DeletionTimestamp != nil || !ns.DeletionTimestamp.IsZero() {
-		glog.V(4).Infof("namespace %s going to delete will ignore", ns.Name)
+		glog.V(3).Infof("Namespace:%s going to delete will ignore", ns.Name)
 		return
 	}
 
-	if ns.Name == "kube-system" || ns.Name == "kube-public" {
-		glog.Infof("skip system namespace: %s", ns.Name)
+	if strings.HasPrefix(ns.Name, "kube") || strings.HasPrefix(ns.Name, "e2e") {
+		glog.V(3).Infof("Skip dedicated namespace:%s", ns.Name)
 		return
 	}
 
-	if _, ok := ns.Annotations["vip"]; ok {
-		glog.Infof("skip vip namespace: %s", ns.Name)
+	if _, ok := ns.Annotations[vipAnnotation]; ok {
+		glog.V(3).Infof("Skip vip namespace:%s", ns.Name)
 		return
 	}
 
-	if _, ok := ns.Annotations["sealed"]; ok {
-		glog.Infof("skip sealed namespace: %s", ns.Name)
+	if _, ok := ns.Annotations[readyAnnotation]; ok {
+		glog.V(3).Infof("Skip initialized namespace:%s", ns.Name)
 		return
 	}
 
@@ -161,99 +163,111 @@ func (nm *NSInitializer) worker() {
 
 // syncNamespaceFromKey looks for a namespace with the specified key in its store and synchronizes it
 func (nm *NSInitializer) syncNamespaceFromKey(key string) error {
+	glog.Infof("Sync namespace:%s", key)
+
 	var (
 		err       error
 		namespace *v1.Namespace
 	)
-	glog.Infof("syncNamespaceFromKey(%s)", key)
 	startTime := time.Now()
 	defer func() {
 		if err == nil {
-			glog.Infof("Finished syncing namespace %q (%v)", key, time.Now().Sub(startTime))
+			glog.Infof("Finished syncing namespace:%s time_cost:%v", key, time.Now().Sub(startTime))
 		} else {
-			glog.Errorf("syncing namespace %s, failed with err:%s", key, err)
+			glog.Errorf("Faied syncing namespace:%s err:%s", key, err)
 		}
 	}()
 
 	namespace, err = nm.lister.Get(key)
 	if errors.IsNotFound(err) {
-		glog.Infof("Namespace has been deleted %v", key)
+		glog.V(1).Infof("Namespace:%s has been deleted", key)
 		return nil
 	}
 	if err != nil {
-		glog.Errorf("Unable to retrieve namespace %s from store: %v", key, err)
-		utilruntime.HandleError(fmt.Errorf("Unable to retrieve namespace %v from store: %v", key, err))
+		glog.Errorf("Unable to retrieve namespace:%s from store err:%v", key, err)
+		utilruntime.HandleError(fmt.Errorf("Unable to retrieve namespace:%v from store err:%v", key, err))
 		return err
 	}
-	if _, ok := namespace.Annotations["vip"]; ok {
-		glog.Infof("vip namespace will not enforce namespace quota & limits")
-		return nil
-	}
-	if _, ok := namespace.Annotations["sealed"]; ok {
-		glog.Infof("namespace %s already sealed", key)
-		return nil
-	}
 	// enforce resource quota & limit range
-	err = nm.sealNamespace(namespace)
+	err = nm.initNamesapce(namespace)
 	return err
 }
 
-func (nm *NSInitializer) sealNamespace(ns *v1.Namespace) error {
+func (nm *NSInitializer) initNamesapce(ns *v1.Namespace) error {
 	var err error
 	err = nm.enforceNamespaceResourceQuota(ns)
 	if err != nil {
 		return err
 	}
-	glog.Infof("enforcedNamespaceResourceQuota on %s", ns.Name)
 	err = nm.enforceNamespaceLimitRange(ns)
 	if err != nil {
 		return err
 	}
-	glog.Infof("enforceNamespaceLimitRange on %s", ns.Name)
-	// make a copy of ns and annotate the namespace
-	return nil
+
+	copy, err := scheme.Scheme.DeepCopy(ns)
+	if err != nil {
+		glog.Errorf("Copy namespace:%s obj:%v failed err:%v", ns.Name, ns, err)
+		return err
+	}
+	ns = copy.(*v1.Namespace)
+	if ns.Annotations == nil {
+		ns.Annotations = make(map[string]string)
+	}
+	ns.Annotations[readyAnnotation] = "ready"
+	_, err = nm.client.Namespaces().Update(ns)
+	if err != nil {
+		glog.Errorf("Mark namespace:%s as ready failed err:%v", ns.Name, err)
+	}
+	return err
 }
+
 func (nm *NSInitializer) enforceNamespaceResourceQuota(ns *v1.Namespace) error {
-	quota, err := nm.client.ResourceQuotas(ns.Name).Get("kirk-default-quota", meta_v1.GetOptions{})
+	var err error
+	_, err = nm.client.ResourceQuotas(ns.Name).Get(quotaName, meta_v1.GetOptions{})
 	if errors.IsNotFound(err) {
 		_, err = nm.client.ResourceQuotas(ns.Name).Create(nm.quota)
 		if err != nil {
-			glog.Errorf("Create ResourceQuotas for namespace:%s failed, err:%s", ns.Name, err)
+			glog.Errorf("Create namespace:%s resourcequota:%s failed err:%v",
+				ns.Name, nm.quota, err)
 		}
-		return err
 	} else if err != nil {
-		glog.Errorf("Get namespace: %s resourcequota: kirk-default-limit failed with err:%#v",
-			ns.Name, err)
+		glog.Errorf("Get namespace:%s resourcequota:%s failed err:%v",
+			ns.Name, quotaName, err)
+	} else {
+		glog.V(2).Infof("Namespace:%s already have resourcequota:%s",
+			ns.Name, quotaName)
 	}
-	glog.Infof("skip Namespace: %s with ResourceQuota: %#v", quota)
-	return nil
+	return err
 }
 
 func (nm *NSInitializer) enforceNamespaceLimitRange(ns *v1.Namespace) error {
-	limit, err := nm.client.LimitRanges(ns.Name).Get("kirk-default-limit", meta_v1.GetOptions{})
+	var err error
+	_, err = nm.client.LimitRanges(ns.Name).Get(limitName, meta_v1.GetOptions{})
 	if errors.IsNotFound(err) {
 		_, err = nm.client.LimitRanges(ns.Name).Create(nm.limits)
 		if err != nil {
-			glog.Errorf("Create LimitRange for namespace:%s failed, err:%s", ns.Name, err)
+			glog.Errorf("Create namespace:%s limitranges:%s failed err:%#v",
+				ns.Name, limitName, err)
 		}
-		return err
 	} else if err != nil {
-		glog.Errorf("Get namespace: %s limitrange: kirk-default-limit failed with err:%#v",
-			ns.Name, err)
+		glog.Errorf("Get namespace:%s limitranges:%s failed err:%s",
+			ns.Name, limitName, err)
+	} else {
+		glog.V(2).Infof("Namespace:%s already have limitranges:%s",
+			ns.Name, limitName)
 	}
-	glog.Infof("skip namespace: %s with limitrange:%#v", ns.Name, limit)
-	return nil
+	return err
 }
 
 func waitForCacheSync(controllerName string, stopCh <-chan struct{}, cacheSyncs ...cache.InformerSynced) bool {
-	glog.Infof("Waiting for caches to sync for %s controller", controllerName)
+	glog.V(4).Infof("Waiting for caches to sync for controller:%s", controllerName)
 
 	if !cache.WaitForCacheSync(stopCh, cacheSyncs...) {
 		utilruntime.HandleError(fmt.Errorf("Unable to sync caches for %s controller", controllerName))
 		return false
 	}
 
-	glog.Infof("Caches are synced for %s controller", controllerName)
+	glog.Infof("Caches are synced for controller:%s", controllerName)
 	return true
 }
 
@@ -262,12 +276,12 @@ func (nm *NSInitializer) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
 	defer nm.queue.ShutDown()
 
-	if !waitForCacheSync("namespace", stopCh, nm.listerSynced) {
+	if !waitForCacheSync("ns-initializer", stopCh, nm.listerSynced) {
 		return
 	}
 
-	glog.Info("Starting workers")
 	for i := 0; i < workers; i++ {
+		glog.Info("Starting workers:%d", i)
 		go wait.Until(nm.worker, time.Second, stopCh)
 	}
 	<-stopCh
